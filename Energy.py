@@ -1,4 +1,3 @@
-
 # Experiment 3: Energy vs. Planning Horizon + Landauer Bound
 
 

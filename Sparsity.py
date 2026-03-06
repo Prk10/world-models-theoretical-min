@@ -1,4 +1,3 @@
-
 # Experiment 2: Activation Sparsity During World Model Planning
 
 

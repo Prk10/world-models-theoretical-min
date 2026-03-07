@@ -6,12 +6,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.profiler import profile, ProfilerActivity
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type != "cuda":
-    raise RuntimeError("Run this on a GPU. Kaggle: Settings → Accelerator → GPU.")
+    raise RuntimeError("Run this on a GPU.")
 print(f"Running on: {torch.cuda.get_device_name(0)}")
 
 
@@ -48,45 +47,48 @@ class RSSM(nn.Module):
 def analytical_flops(model, B):
     S, D, A = model.stoch_size, model.latent_dim, 6
     return {
-        "GRU Transition":     3 * 2 * (S + A + D) * D * B,
-        "Prior Network":      (2 * D * D + 2 * D * S) * B,
-        "Projection":         2 * (D + S) * D * B,
+        "GRU Transition":      3 * 2 * (S + A + D) * D * B,
+        "Prior Network":       (2 * D * D + 2 * D * S) * B,
+        "Projection":          2 * (D + S) * D * B,
         "Stochastic Sampling": model.stoch_dim * model.stoch_classes * 3 * B,
     }
 
 
-def profile_single_op(fn, n_warmup=10, n_active=5):
-    
+def measure_bytes(fn, n_warmup=20, n_active=50):
+   
+    model_ref = fn  
+
     for _ in range(n_warmup):
         with torch.no_grad():
             fn()
     torch.cuda.synchronize()
 
-    
-    with profile(
-        activities=[ProfilerActivity.CUDA],
-        profile_memory=True,
-        record_shapes=False,
-        with_flops=False,       
-    ) as prof:
-        for _ in range(n_active):
-            with torch.no_grad():
-                fn()
+  
+    byte_deltas = []
+    for _ in range(n_active):
+        torch.cuda.reset_peak_memory_stats(device)
+        before = torch.cuda.memory_stats(device).get("allocated_bytes.all.current", 0)
+
+        with torch.no_grad():
+            fn()
         torch.cuda.synchronize()
 
-    
-    total_bytes = sum(
-        abs(e.self_cuda_memory_usage)
-        for e in prof.key_averages()
-        if e.self_cuda_memory_usage != 0
-    )
+        after = torch.cuda.memory_stats(device).get("allocated_bytes.all.current", 0)
+        peak  = torch.cuda.memory_stats(device).get("allocated_bytes.all.peak", 0)
 
-    
-    return total_bytes / n_active if total_bytes > 0 else None
+        
+        delta = peak - before
+        if delta > 0:
+            byte_deltas.append(delta)
+
+    if not byte_deltas:
+        return None
+
+    return float(np.median(byte_deltas))   
+
 
 
 def measure_all_ops(model, B=32, action_dim=6):
-    
     model.eval()
 
     
@@ -97,44 +99,49 @@ def measure_all_ops(model, B=32, action_dim=6):
     action = torch.randn(B, action_dim, device=device)
 
     
-    x        = torch.cat([stoch, action], dim=-1)
-    det_new  = model.gru(x, det)
-    logits   = model.prior(det_new)
-    stoch_new = torch.softmax(
-        logits.view(B, model.stoch_dim, model.stoch_classes), dim=-1
-    ).view(B, -1)
+    with torch.no_grad():
+        x        = torch.cat([stoch, action], dim=-1)
+        det_new  = model.gru(x, det)
+        logits   = model.prior(det_new)
+        stoch_new = torch.softmax(
+            logits.view(B, model.stoch_dim, model.stoch_classes), dim=-1
+        ).view(B, -1)
 
-    
     ops = {
-        "GRU Transition":     lambda: model.gru(torch.cat([stoch, action], dim=-1), det),
-        "Prior Network":      lambda: model.prior(det_new),
-        "Stochastic Sampling": lambda: torch.softmax(
-            logits.view(B, model.stoch_dim, model.stoch_classes), dim=-1).view(B, -1),
-        "Projection":         lambda: model.proj(torch.cat([det_new, stoch_new], dim=-1)),
+        "GRU Transition":
+            lambda: model.gru(torch.cat([stoch, action], dim=-1), det),
+        "Prior Network":
+            lambda: model.prior(det_new),
+        "Stochastic Sampling":
+            lambda: torch.softmax(
+                logits.view(B, model.stoch_dim, model.stoch_classes), dim=-1
+            ).view(B, -1),
+        "Projection":
+            lambda: model.proj(torch.cat([det_new, stoch_new], dim=-1)),
     }
 
     flops_dict = analytical_flops(model, B)
     results    = {}
 
     for name, fn in ops.items():
-        print(f"  Profiling: {name} ...", end=" ", flush=True)
-        bytes_measured = profile_single_op(fn)
+        print(f"  Measuring: {name} ...", end=" ", flush=True)
+        measured = measure_bytes(fn)
 
-        if bytes_measured and bytes_measured > 0:
-            intensity   = flops_dict[name] / bytes_measured
-            byte_source = "profiler (hardware)"
-            print(f"{bytes_measured:,.0f} bytes → {intensity:.2f} FLOPs/byte")
+        if measured and measured > 0:
+            intensity   = flops_dict[name] / measured
+            byte_source = "memory_stats (hardware)"
+            print(f"{measured:,.0f} bytes  →  {intensity:.2f} FLOPs/byte")
         else:
             
-            bytes_measured = flops_dict[name] / 10.0
-            intensity      = 10.0
-            byte_source    = "analytical (fallback)"
-            print(f"profiler returned 0 — using fallback")
+            measured    = flops_dict[name] / 10.0
+            intensity   = 10.0
+            byte_source = "analytical (fallback)"
+            print("allocator returned 0 — using fallback")
 
         results[name] = {
             "intensity":   intensity,
             "flops":       flops_dict[name],
-            "bytes":       bytes_measured,
+            "bytes":       measured,
             "byte_source": byte_source,
         }
 
@@ -150,23 +157,23 @@ def plot_roofline(results, save_path="figure1_roofline.png"):
     ax.axvline(RIDGE_POINT, color='gray', linestyle='--', alpha=0.6,
                label=f'Ridge point ({RIDGE_POINT:.0f} FLOPs/byte)')
     ax.axvspan(x[0], RIDGE_POINT, alpha=0.06, color='red')
-    ax.text(x[0]*1.2, PEAK_FLOPS*0.3, 'Memory-\nBound', color='red',
-            alpha=0.6, fontsize=9)
+    ax.text(x[0] * 1.2, PEAK_FLOPS * 0.3, 'Memory-\nBound',
+            color='red', alpha=0.6, fontsize=9)
 
     colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']
     for (name, data), color in zip(results.items(), colors):
         I    = data["intensity"]
         perf = min(I * PEAK_BW, PEAK_FLOPS)
-        src  = data["byte_source"]
         ax.scatter(I, perf, s=140, color=color, zorder=5,
-                   label=f'{name} ({I:.1f} FLOPs/byte) [{src}]')
+                   label=f'{name}  ({I:.1f} FLOPs/byte)  [{data["byte_source"]}]')
         ax.annotate(name, (I, perf), textcoords="offset points",
                     xytext=(6, 5), fontsize=8)
 
     ax.set_xlabel("Arithmetic Intensity (FLOPs / Byte)", fontsize=12)
     ax.set_ylabel("Attainable Performance (FLOPs / sec)", fontsize=12)
-    ax.set_title(f"Roofline Analysis — World Model Planning\n"
-                 f"({torch.cuda.get_device_name(0)})", fontsize=12)
+    ax.set_title(
+        f"Roofline Analysis — World Model Planning\n({torch.cuda.get_device_name(0)})",
+        fontsize=12)
     ax.legend(fontsize=7, loc='upper left')
     ax.grid(True, which='both', alpha=0.3)
     plt.tight_layout()
@@ -179,12 +186,12 @@ if __name__ == "__main__":
     BATCH_SIZE = 32
     model = RSSM().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+    print("Measuring byte traffic via cuda.memory_stats() deltas...\n")
 
-    print("Profiling each operation in an isolated context...\n")
     results = measure_all_ops(model, B=BATCH_SIZE)
 
-    print(f"\n{'Operation':<25} {'Intensity':>12} {'FLOPs':>15} {'Bytes':>15} Source")
-    print("-" * 95)
+    print(f"\n{'Operation':<25} {'Intensity':>12} {'FLOPs':>15} {'Bytes':>15}  Source")
+    print("-" * 100)
     for name, d in results.items():
         print(f"{name:<25} {d['intensity']:>12.2f} {d['flops']:>15,} "
               f"{d['bytes']:>15,.0f}  {d['byte_source']}")
@@ -195,7 +202,6 @@ if __name__ == "__main__":
 
     plot_roofline(results)
 
-    print("\nNote: torch.profiler captures memory allocation events, not raw DRAM transactions.")
-    print("For exact DRAM byte counts, use Nsight Compute offline (not available in Kaggle).")
-    print("Reported intensities are upper bounds on true intensity — memory-bound")
-    print("conclusion is therefore conservative.")
+    print("\nNote: memory_stats() reports allocator-level byte deltas, not raw DRAM")
+    print("transactions. Reported intensities are upper bounds on true intensity.")
+    print("Memory-bound conclusion is therefore conservative.")

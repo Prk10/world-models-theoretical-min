@@ -1,13 +1,37 @@
+"""
+Experiment 1: Roofline Analysis of World Model Planning
+========================================================
+Byte traffic is computed analytically from parameter counts and tensor sizes,
+following standard roofline methodology for neural network operations.
+
+Why not memory_stats(): that API counts new allocator-level allocations only.
+Weight matrices are allocated at model init and never re-allocated during
+forward passes, so memory_stats() misses them entirely — the dominant source
+of memory traffic in linear/GRU operations. This makes intensities appear
+artificially high and falsely compute-bound.
+
+Why not torch.profiler: Kineto event reassociation fails on Kaggle T4,
+causing all operations to return zero CUDA memory events.
+
+Correct approach: count the minimum bytes that must be transferred from DRAM
+for each operation — weights + inputs + outputs — using tensor dimensions.
+These are lower bounds on true DRAM traffic (cache misses and bus granularity
+increase actual traffic further), so resulting intensities are upper bounds.
+Memory-bound conclusions are therefore conservative.
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 
+# ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type != "cuda":
     raise RuntimeError("Run this on a GPU. Kaggle: Settings → Accelerator → GPU.")
 print(f"Running on: {torch.cuda.get_device_name(0)}")
 
+# ── GPU hardware limits ───────────────────────────────────────────────────────
 GPU_NAME = torch.cuda.get_device_name(0).upper()
 if   "T4"   in GPU_NAME: PEAK_FLOPS, PEAK_BW = 8.1e12,  300e9
 elif "P100" in GPU_NAME: PEAK_FLOPS, PEAK_BW = 9.3e12,  732e9
@@ -21,8 +45,9 @@ RIDGE_POINT = PEAK_FLOPS / PEAK_BW
 print(f"Hardware: {PEAK_FLOPS/1e12:.1f} TFLOPS | {PEAK_BW/1e9:.0f} GB/s | "
       f"Ridge = {RIDGE_POINT:.1f} FLOPs/byte\n")
 
-BYTES_PER_FLOAT = 4
+BYTES_PER_FLOAT = 4  # FP32
 
+# ── Minimal RSSM ──────────────────────────────────────────────────────────────
 class RSSM(nn.Module):
     def __init__(self, latent_dim=512, stoch_dim=32, stoch_classes=32, action_dim=6):
         super().__init__()
@@ -39,47 +64,70 @@ class RSSM(nn.Module):
         )
         self.proj  = nn.Linear(latent_dim + self.stoch_size, latent_dim)
 
+# ── Analytical FLOPs ──────────────────────────────────────────────────────────
 def analytical_flops(m, B):
     S, D, A = m.stoch_size, m.latent_dim, m.action_dim
     return {
         "GRU Transition":
-            3 * 2 * (S + A + D) * D * B,
+            3 * 2 * (S + A + D) * D * B,          # 3 gates × matmul (input+hidden)
         "Prior Network":
-            (2 * D * D + 2 * D * S) * B,
+            (2 * D * D + 2 * D * S) * B,           # Linear(D→D) + Linear(D→S)
         "Projection":
-            2 * (D + S) * D * B,
+            2 * (D + S) * D * B,                   # Linear(D+S→D)
         "Stochastic Sampling":
-            m.stoch_dim * m.stoch_classes * 3 * B,
+            m.stoch_dim * m.stoch_classes * 3 * B, # softmax (exp + sum + div)
     }
 
+# ── Analytical bytes: weights + inputs + outputs ──────────────────────────────
 def analytical_bytes(m, B):
+    """
+    Minimum bytes that must be read from / written to DRAM per operation.
+
+    For each operation we count:
+      - Weight parameters (read once per forward pass from DRAM)
+      - Input activation tensor(s) (read)
+      - Output activation tensor(s) (write)
+
+    This is the standard roofline byte model for DNN workloads.
+    Actual DRAM traffic is higher due to cache misses and bus alignment,
+    so these byte counts are lower bounds → intensities are upper bounds.
+    """
     S, D, A = m.stoch_size, m.latent_dim, m.action_dim
     bp = BYTES_PER_FLOAT
 
+    # ── GRU Transition ────────────────────────────────────────────────────────
+    # GRUCell has two weight matrices and two bias vectors per gate (3 gates):
+    #   weight_ih: (3*D) × (S+A)   — maps input [stoch; action] to gates
+    #   weight_hh: (3*D) × D       — maps hidden state to gates
+    #   bias_ih, bias_hh: (3*D) each
     gru_weights = (3*D*(S+A) + 3*D*D + 2*3*D) * bp
-    gru_input   = B * (S + A) * bp
-    gru_hidden  = B * D * bp
-    gru_output  = B * D * bp
+    gru_input   = B * (S + A) * bp    # concatenated [stoch; action]
+    gru_hidden  = B * D * bp          # input hidden state
+    gru_output  = B * D * bp          # output hidden state
     gru_bytes   = gru_weights + gru_input + gru_hidden + gru_output
 
-    prior_w1  = D * D * bp
-    prior_b1  = D * bp
-    prior_w2  = D * S * bp
-    prior_b2  = S * bp
-    prior_in  = B * D * bp
-    prior_mid = B * D * bp
-    prior_out = B * S * bp
+    # ── Prior Network: Linear(D→D) + ELU + Linear(D→S) ───────────────────────
+    prior_w1  = D * D * bp            # weight matrix layer 1
+    prior_b1  = D * bp                # bias layer 1
+    prior_w2  = D * S * bp            # weight matrix layer 2
+    prior_b2  = S * bp                # bias layer 2
+    prior_in  = B * D * bp            # input (deterministic state)
+    prior_mid = B * D * bp            # intermediate activation
+    prior_out = B * S * bp            # output logits
     prior_bytes = prior_w1 + prior_b1 + prior_w2 + prior_b2 + \
                   prior_in + prior_mid + prior_out
 
-    proj_w    = (D + S) * D * bp
-    proj_b    = D * bp
-    proj_in   = B * (D + S) * bp
-    proj_out  = B * D * bp
+    # ── Projection: Linear(D+S→D) ─────────────────────────────────────────────
+    proj_w    = (D + S) * D * bp      # weight matrix
+    proj_b    = D * bp                # bias
+    proj_in   = B * (D + S) * bp     # input (concat det + stoch)
+    proj_out  = B * D * bp            # output feature
     proj_bytes = proj_w + proj_b + proj_in + proj_out
 
-    samp_in   = B * S * bp
-    samp_out  = B * S * bp
+    # ── Stochastic Sampling: softmax over (stoch_dim × stoch_classes) ─────────
+    # Input logits already computed by prior — read them, write output
+    samp_in   = B * S * bp            # input logits (reshaped)
+    samp_out  = B * S * bp            # output probabilities
     samp_bytes = samp_in + samp_out
 
     return {
@@ -89,6 +137,7 @@ def analytical_bytes(m, B):
         "Stochastic Sampling": samp_bytes,
     }
 
+# ── Compute roofline points ───────────────────────────────────────────────────
 def compute_roofline(model, B=32):
     flops = analytical_flops(model, B)
     bytes_ = analytical_bytes(model, B)
@@ -107,6 +156,7 @@ def compute_roofline(model, B=32):
               f"({f:,} FLOPs / {b:,} bytes)")
     return results
 
+# ── Roofline plot ─────────────────────────────────────────────────────────────
 def plot_roofline(results, save_path="figure1_roofline.png"):
     x    = np.logspace(-2, 4, 500)
     roof = np.minimum(x * PEAK_BW, PEAK_FLOPS)
@@ -116,39 +166,43 @@ def plot_roofline(results, save_path="figure1_roofline.png"):
     ax.axvline(RIDGE_POINT, color='gray', linestyle='--', alpha=0.6,
                label=f'Ridge point ({RIDGE_POINT:.0f} FLOPs/byte)')
     ax.axvspan(x[0], RIDGE_POINT, alpha=0.06, color='red')
-    ax.text(x[0] * 1.4, PEAK_FLOPS * 0.15, 'Memory-\nBound',
+    ax.text(x[0] * 1.4, PEAK_FLOPS * 0.04, 'Memory-\nBound',
             color='red', alpha=0.7, fontsize=10, fontweight='bold')
 
     colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']
 
-    v_spread = {
-        "GRU Transition":      2.2,
-        "Prior Network":       1.0,
-        "Projection":          0.45,
-        "Stochastic Sampling": 1.0,
+    # Small horizontal jitter (log-scale multipliers) to separate dots
+    # that share nearly the same arithmetic intensity (~15 FLOPs/byte).
+    # Dots stay ON the roofline slope — only x shifts slightly.
+    x_jitter = {
+        "GRU Transition":      1.25,   # nudge right
+        "Prior Network":       1.00,   # centre
+        "Projection":          0.80,   # nudge left
+        "Stochastic Sampling": 1.00,   # far left, no overlap
     }
 
+    # Label offsets to avoid collisions
     label_offsets = {
-        "GRU Transition":      ( 8,  6),
-        "Prior Network":       ( 8,  6),
-        "Projection":          ( 8, -14),
-        "Stochastic Sampling": ( 8,  6),
+        "GRU Transition":      ( 10,  6),
+        "Prior Network":       ( 10,  6),
+        "Projection":          ( 10, -16),
+        "Stochastic Sampling": ( 10,  6),
     }
 
     for (name, data), color in zip(results.items(), colors):
-        I      = data["intensity"]
-        perf   = min(I * PEAK_BW, PEAK_FLOPS) * v_spread[name]
-        ox, oy = label_offsets[name]
+        I_true  = data["intensity"]               # true arithmetic intensity
+        I_plot  = I_true * x_jitter[name]         # jittered x for visual separation
+        perf    = min(I_plot * PEAK_BW, PEAK_FLOPS)  # must stay on roofline
+        ox, oy  = label_offsets[name]
 
-        ax.scatter(I, perf, s=160, color=color, zorder=5,
-                   label=f'{name}  ({I:.1f} FLOPs/byte)',
+        ax.scatter(I_plot, perf, s=160, color=color, zorder=5,
+                   label=f'{name}  ({I_true:.1f} FLOPs/byte)',
                    edgecolors='white', linewidths=0.8)
         ax.annotate(
-            name, (I, perf),
+            name, (I_plot, perf),
             textcoords="offset points",
             xytext=(ox, oy),
             fontsize=8.5,
-            arrowprops=dict(arrowstyle='-', color='gray', lw=0.8),
         )
 
     ax.set_xlabel("Arithmetic Intensity (FLOPs / Byte)", fontsize=12)
@@ -165,6 +219,7 @@ def plot_roofline(results, save_path="figure1_roofline.png"):
     print(f"\nFigure saved: {save_path}")
     plt.close()
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     BATCH_SIZE = 32
     model = RSSM().to(device)

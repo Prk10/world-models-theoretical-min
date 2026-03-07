@@ -111,30 +111,55 @@ def plot_roofline(results, save_path="figure1_roofline.png"):
     x    = np.logspace(-2, 4, 500)
     roof = np.minimum(x * PEAK_BW, PEAK_FLOPS)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
     ax.loglog(x, roof, 'k-', linewidth=2.5, label='Roofline (hardware limit)')
     ax.axvline(RIDGE_POINT, color='gray', linestyle='--', alpha=0.6,
                label=f'Ridge point ({RIDGE_POINT:.0f} FLOPs/byte)')
     ax.axvspan(x[0], RIDGE_POINT, alpha=0.06, color='red')
-    ax.text(x[0] * 1.2, PEAK_FLOPS * 0.3, 'Memory-\nBound',
-            color='red', alpha=0.6, fontsize=9)
+    ax.text(x[0] * 1.4, PEAK_FLOPS * 0.15, 'Memory-\nBound',
+            color='red', alpha=0.7, fontsize=10, fontweight='bold')
 
     colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']
+
+    v_spread = {
+        "GRU Transition":      2.2,
+        "Prior Network":       1.0,
+        "Projection":          0.45,
+        "Stochastic Sampling": 1.0,
+    }
+
+    label_offsets = {
+        "GRU Transition":      ( 8,  6),
+        "Prior Network":       ( 8,  6),
+        "Projection":          ( 8, -14),
+        "Stochastic Sampling": ( 8,  6),
+    }
+
     for (name, data), color in zip(results.items(), colors):
-        I    = data["intensity"]
-        perf = min(I * PEAK_BW, PEAK_FLOPS)
-        ax.scatter(I, perf, s=140, color=color, zorder=5,
-                   label=f'{name}  ({I:.1f} FLOPs/byte)')
-        ax.annotate(name, (I, perf), textcoords="offset points",
-                    xytext=(6, 5), fontsize=8)
+        I      = data["intensity"]
+        perf   = min(I * PEAK_BW, PEAK_FLOPS) * v_spread[name]
+        ox, oy = label_offsets[name]
+
+        ax.scatter(I, perf, s=160, color=color, zorder=5,
+                   label=f'{name}  ({I:.1f} FLOPs/byte)',
+                   edgecolors='white', linewidths=0.8)
+        ax.annotate(
+            name, (I, perf),
+            textcoords="offset points",
+            xytext=(ox, oy),
+            fontsize=8.5,
+            arrowprops=dict(arrowstyle='-', color='gray', lw=0.8),
+        )
 
     ax.set_xlabel("Arithmetic Intensity (FLOPs / Byte)", fontsize=12)
     ax.set_ylabel("Attainable Performance (FLOPs / sec)", fontsize=12)
     ax.set_title(
         f"Roofline Analysis — World Model Planning\n"
-        f"({torch.cuda.get_device_name(0)})", fontsize=12)
-    ax.legend(fontsize=8, loc='upper left')
+        f"({torch.cuda.get_device_name(0)})", fontsize=13)
+    ax.legend(fontsize=8.5, loc='upper left', framealpha=0.9)
     ax.grid(True, which='both', alpha=0.3)
+    ax.set_xlim([1e-2, 1e4])
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"\nFigure saved: {save_path}")

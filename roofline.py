@@ -1,18 +1,12 @@
-
-# Experiment 1: Roofline Analysis of World Model Planning
-
-
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type != "cuda":
-    raise RuntimeError("Run this on a GPU.")
+    raise RuntimeError("Run this on a GPU. Kaggle: Settings → Accelerator → GPU.")
 print(f"Running on: {torch.cuda.get_device_name(0)}")
-
 
 GPU_NAME = torch.cuda.get_device_name(0).upper()
 if   "T4"   in GPU_NAME: PEAK_FLOPS, PEAK_BW = 8.1e12,  300e9
@@ -27,6 +21,7 @@ RIDGE_POINT = PEAK_FLOPS / PEAK_BW
 print(f"Hardware: {PEAK_FLOPS/1e12:.1f} TFLOPS | {PEAK_BW/1e9:.0f} GB/s | "
       f"Ridge = {RIDGE_POINT:.1f} FLOPs/byte\n")
 
+BYTES_PER_FLOAT = 4
 
 class RSSM(nn.Module):
     def __init__(self, latent_dim=512, stoch_dim=32, stoch_classes=32, action_dim=6):
@@ -35,6 +30,7 @@ class RSSM(nn.Module):
         self.stoch_dim     = stoch_dim
         self.stoch_classes = stoch_classes
         self.stoch_size    = stoch_dim * stoch_classes
+        self.action_dim    = action_dim
 
         self.gru   = nn.GRUCell(self.stoch_size + action_dim, latent_dim)
         self.prior = nn.Sequential(
@@ -43,110 +39,73 @@ class RSSM(nn.Module):
         )
         self.proj  = nn.Linear(latent_dim + self.stoch_size, latent_dim)
 
-
-def analytical_flops(model, B):
-    S, D, A = model.stoch_size, model.latent_dim, 6
+def analytical_flops(m, B):
+    S, D, A = m.stoch_size, m.latent_dim, m.action_dim
     return {
-        "GRU Transition":      3 * 2 * (S + A + D) * D * B,
-        "Prior Network":       (2 * D * D + 2 * D * S) * B,
-        "Projection":          2 * (D + S) * D * B,
-        "Stochastic Sampling": model.stoch_dim * model.stoch_classes * 3 * B,
-    }
-
-
-def measure_bytes(fn, n_warmup=20, n_active=50):
-   
-    model_ref = fn  
-
-    for _ in range(n_warmup):
-        with torch.no_grad():
-            fn()
-    torch.cuda.synchronize()
-
-  
-    byte_deltas = []
-    for _ in range(n_active):
-        torch.cuda.reset_peak_memory_stats(device)
-        before = torch.cuda.memory_stats(device).get("allocated_bytes.all.current", 0)
-
-        with torch.no_grad():
-            fn()
-        torch.cuda.synchronize()
-
-        after = torch.cuda.memory_stats(device).get("allocated_bytes.all.current", 0)
-        peak  = torch.cuda.memory_stats(device).get("allocated_bytes.all.peak", 0)
-
-        
-        delta = peak - before
-        if delta > 0:
-            byte_deltas.append(delta)
-
-    if not byte_deltas:
-        return None
-
-    return float(np.median(byte_deltas))   
-
-
-
-def measure_all_ops(model, B=32, action_dim=6):
-    model.eval()
-
-    
-    det    = torch.randn(B, model.latent_dim, device=device)
-    stoch  = torch.softmax(
-        torch.randn(B, model.stoch_dim, model.stoch_classes, device=device),
-        dim=-1).view(B, -1)
-    action = torch.randn(B, action_dim, device=device)
-
-    
-    with torch.no_grad():
-        x        = torch.cat([stoch, action], dim=-1)
-        det_new  = model.gru(x, det)
-        logits   = model.prior(det_new)
-        stoch_new = torch.softmax(
-            logits.view(B, model.stoch_dim, model.stoch_classes), dim=-1
-        ).view(B, -1)
-
-    ops = {
         "GRU Transition":
-            lambda: model.gru(torch.cat([stoch, action], dim=-1), det),
+            3 * 2 * (S + A + D) * D * B,
         "Prior Network":
-            lambda: model.prior(det_new),
-        "Stochastic Sampling":
-            lambda: torch.softmax(
-                logits.view(B, model.stoch_dim, model.stoch_classes), dim=-1
-            ).view(B, -1),
+            (2 * D * D + 2 * D * S) * B,
         "Projection":
-            lambda: model.proj(torch.cat([det_new, stoch_new], dim=-1)),
+            2 * (D + S) * D * B,
+        "Stochastic Sampling":
+            m.stoch_dim * m.stoch_classes * 3 * B,
     }
 
-    flops_dict = analytical_flops(model, B)
-    results    = {}
+def analytical_bytes(m, B):
+    S, D, A = m.stoch_size, m.latent_dim, m.action_dim
+    bp = BYTES_PER_FLOAT
 
-    for name, fn in ops.items():
-        print(f"  Measuring: {name} ...", end=" ", flush=True)
-        measured = measure_bytes(fn)
+    gru_weights = (3*D*(S+A) + 3*D*D + 2*3*D) * bp
+    gru_input   = B * (S + A) * bp
+    gru_hidden  = B * D * bp
+    gru_output  = B * D * bp
+    gru_bytes   = gru_weights + gru_input + gru_hidden + gru_output
 
-        if measured and measured > 0:
-            intensity   = flops_dict[name] / measured
-            byte_source = "memory_stats (hardware)"
-            print(f"{measured:,.0f} bytes  →  {intensity:.2f} FLOPs/byte")
-        else:
-            
-            measured    = flops_dict[name] / 10.0
-            intensity   = 10.0
-            byte_source = "analytical (fallback)"
-            print("allocator returned 0 — using fallback")
+    prior_w1  = D * D * bp
+    prior_b1  = D * bp
+    prior_w2  = D * S * bp
+    prior_b2  = S * bp
+    prior_in  = B * D * bp
+    prior_mid = B * D * bp
+    prior_out = B * S * bp
+    prior_bytes = prior_w1 + prior_b1 + prior_w2 + prior_b2 + \
+                  prior_in + prior_mid + prior_out
 
+    proj_w    = (D + S) * D * bp
+    proj_b    = D * bp
+    proj_in   = B * (D + S) * bp
+    proj_out  = B * D * bp
+    proj_bytes = proj_w + proj_b + proj_in + proj_out
+
+    samp_in   = B * S * bp
+    samp_out  = B * S * bp
+    samp_bytes = samp_in + samp_out
+
+    return {
+        "GRU Transition":      gru_bytes,
+        "Prior Network":       prior_bytes,
+        "Projection":          proj_bytes,
+        "Stochastic Sampling": samp_bytes,
+    }
+
+def compute_roofline(model, B=32):
+    flops = analytical_flops(model, B)
+    bytes_ = analytical_bytes(model, B)
+
+    results = {}
+    for name in flops:
+        f = flops[name]
+        b = bytes_[name]
         results[name] = {
-            "intensity":   intensity,
-            "flops":       flops_dict[name],
-            "bytes":       measured,
-            "byte_source": byte_source,
+            "intensity":   f / b,
+            "flops":       f,
+            "bytes":       b,
+            "byte_source": "analytical (weights+IO)",
         }
-
+        print(f"  {name:<25}  {f/b:>7.2f} FLOPs/byte  "
+              f"({f:,} FLOPs / {b:,} bytes)")
     return results
-
 
 def plot_roofline(results, save_path="figure1_roofline.png"):
     x    = np.logspace(-2, 4, 500)
@@ -165,36 +124,34 @@ def plot_roofline(results, save_path="figure1_roofline.png"):
         I    = data["intensity"]
         perf = min(I * PEAK_BW, PEAK_FLOPS)
         ax.scatter(I, perf, s=140, color=color, zorder=5,
-                   label=f'{name}  ({I:.1f} FLOPs/byte)  [{data["byte_source"]}]')
+                   label=f'{name}  ({I:.1f} FLOPs/byte)')
         ax.annotate(name, (I, perf), textcoords="offset points",
                     xytext=(6, 5), fontsize=8)
 
     ax.set_xlabel("Arithmetic Intensity (FLOPs / Byte)", fontsize=12)
     ax.set_ylabel("Attainable Performance (FLOPs / sec)", fontsize=12)
     ax.set_title(
-        f"Roofline Analysis — World Model Planning\n({torch.cuda.get_device_name(0)})",
-        fontsize=12)
-    ax.legend(fontsize=7, loc='upper left')
+        f"Roofline Analysis — World Model Planning\n"
+        f"({torch.cuda.get_device_name(0)})", fontsize=12)
+    ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, which='both', alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"\nFigure saved: {save_path}")
     plt.close()
 
-
 if __name__ == "__main__":
     BATCH_SIZE = 32
     model = RSSM().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
-    print("Measuring byte traffic via cuda.memory_stats() deltas...\n")
+    print("Computing arithmetic intensity (analytical FLOPs / analytical bytes)...\n")
 
-    results = measure_all_ops(model, B=BATCH_SIZE)
+    results = compute_roofline(model, B=BATCH_SIZE)
 
-    print(f"\n{'Operation':<25} {'Intensity':>12} {'FLOPs':>15} {'Bytes':>15}  Source")
-    print("-" * 100)
+    print(f"\n{'Operation':<25} {'Intensity':>10} {'FLOPs':>15} {'Bytes':>15}")
+    print("-" * 70)
     for name, d in results.items():
-        print(f"{name:<25} {d['intensity']:>12.2f} {d['flops']:>15,} "
-              f"{d['bytes']:>15,.0f}  {d['byte_source']}")
+        print(f"{name:<25} {d['intensity']:>10.2f} {d['flops']:>15,} {d['bytes']:>15,}")
 
     n_mem = sum(1 for d in results.values() if d["intensity"] < RIDGE_POINT)
     print(f"\nKey finding: {n_mem}/{len(results)} operations are memory-bandwidth-bound")
@@ -202,6 +159,8 @@ if __name__ == "__main__":
 
     plot_roofline(results)
 
-    print("\nNote: memory_stats() reports allocator-level byte deltas, not raw DRAM")
-    print("transactions. Reported intensities are upper bounds on true intensity.")
-    print("Memory-bound conclusion is therefore conservative.")
+    print("\nMethodological note: bytes = weight parameters + input tensors + output")
+    print("tensors, all in FP32. This is the minimum DRAM traffic model; actual")
+    print("traffic is higher due to cache misses and memory bus alignment.")
+    print("Reported intensities are therefore upper bounds — memory-bound")
+    print("conclusion is conservative.")
